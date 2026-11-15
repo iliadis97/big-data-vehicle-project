@@ -1,0 +1,11 @@
+.venv/
+.idea/
+__pycache__/
+stream_input/
+checkpoint/
+data/assets/
+*.crc
+spark-warehouse/
+data/
+/*.png
+output/
