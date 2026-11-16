@@ -7,7 +7,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 import os
 
-BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sample")
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "assets")
 
 script_start = time.perf_counter()
 
