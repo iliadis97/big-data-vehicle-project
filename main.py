@@ -6,8 +6,20 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 import os
+import sys
 
-BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "assets")
+N_TRIPS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "data", "assets")
+FACT = f"{BASE}/fact_signal_data"
+trip_dirs = sorted(d for d in os.listdir(FACT) if os.path.isdir(os.path.join(FACT, d)))
+selected = [os.path.join(FACT, d) for d in trip_dirs[:N_TRIPS]]
+
+#Store alerts as one readable CSV with the names used in the assignment
+OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", f"trips_{N_TRIPS}")
+os.makedirs(OUTPUT, exist_ok=True)
+
+print(f"Loading {len(selected)} of {len(trip_dirs)} available trip folders")
 
 script_start = time.perf_counter()
 
@@ -15,7 +27,7 @@ script_start = time.perf_counter()
 spark = (
     SparkSession.builder.master("local[*]")
     .appName("first-look")
-    .config("spark.driver.memory", "8g")
+    .config("spark.driver.memory", "16g")
     .config("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
     .getOrCreate()
 )
@@ -41,10 +53,21 @@ def gap_alerts(df, minutes):
                          F.lit(f" min (threshold {minutes} min), since "),
                          F.col("prev_ts").cast("string")).alias("description")))
 
-signals = spark.read.parquet(f"{BASE}/dim_signal_info")
+#Measure time between two Spark queries, one for vehicle speed and one for lag
+def timed(label, df, runs=3):
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        df.collect()
+        times.append(time.perf_counter() - t0)
+    print(f"{label}: first run {times[0]:.2f}s, later runs "
+          + ", ".join(f"{t:.2f}s" for t in times[1:]))
+    return times
 
-factDf = spark.read.option("mergeSchema", "true").parquet(f"{BASE}/fact_signal_data")
-
+factDf = (spark.read
+          .option("mergeSchema", "true")
+          .option("basePath", FACT)
+          .parquet(*selected))
 
 print("\nFact table columns and types:")
 factDf.printSchema()
@@ -54,6 +77,10 @@ factDf.show(truncate=False)
 #Number of vehicles
 veh_number = factDf.select("vehicle_id").distinct().count()
 print("Number of vehicles: ", veh_number)
+
+#Number of trips
+trips = factDf.select("session_id").distinct().count()
+print("Number of trips: ", trips)
 
 #Total number of records
 total_records = factDf.count()
@@ -66,13 +93,23 @@ factDf.agg(F.min("timestamp").alias("Start date"), F.max("timestamp").alias("End
 #Create a single value column with either the float or int value, discard string
 factDf = (
     factDf
-    .drop("_ducklake_internal_row_id", "_ducklake_internal_snapshot_id", "string_value")
+    .select("vehicle_id", "vehicle_name", "session_id", "signal_id", "timestamp", "float_value", "int_value")
     .withColumn("value", F.coalesce(F.col("float_value"), F.col("int_value").cast("double")))
     .drop("float_value", "int_value")
 )
 
 #Condition to track speed readings
 is_speed = F.col("signal_id") == 680
+
+#Fix: Apply missing value and abnormal speed check on the initial data
+print("Missing value:", factDf.filter(F.col("value").isNull()).count())
+print("Missing timestamp:", factDf.filter(F.col("timestamp").isNull()).count())
+print("Negative speed:", factDf.filter(is_speed & (F.col("value") < 0)).count())
+
+#Duplicate check based on combination of timestamp, session and signal
+key = ['timestamp', 'session_id', 'signal_id']
+duplicates = total_records - factDf.dropDuplicates(key).count()
+print("Duplicate rows:", duplicates)
 
 cleanDf = (
     factDf
@@ -87,17 +124,6 @@ print("Count per day:")
 cleanDf.groupBy(F.to_date("timestamp").alias("day")).count().show()
 print("Count per hour:")
 cleanDf.groupBy(F.date_trunc("hour", "timestamp").alias("hour")).count().orderBy("hour").show()
-
-
-
-print("Missing value:", cleanDf.filter(F.col("value").isNull()).count())
-print("Missing timestamp:", cleanDf.filter(F.col("timestamp").isNull()).count())
-print("Negative speed:", cleanDf.filter(is_speed & (F.col("value") < 0)).count())
-
-#Duplicate check based on combination of timestamp, session and signal
-key = ['timestamp', 'session_id', 'signal_id']
-duplicates = total_records - cleanDf.dropDuplicates(key).count()
-print("Duplicate rows:", duplicates)
 
 #Data analysis
 #Records per vehicle
@@ -130,13 +156,22 @@ bad = median_speed.filter(F.col("median_speed") > max_plausible_speed)
 bad_ids = [r["vehicle_id"] for r in bad.collect()]
 print("Excluded from speed analysis:", bad_ids)
 
+
+is_implausible = is_speed & (F.col("value") > max_plausible_speed)
+
+#Vehicle-level exclusion plus record-level exclusion
+validDf = (cleanDf
+    .filter(~F.col("vehicle_id").isin(bad_ids))
+    .filter(~is_implausible)
+)
+
 #Gas pedal usage
 gas_signal = 157
 full_throttle = 0.99          # pedal position treated as 100% (scale is 0-1)
 full_throttle_seconds = 5     # minimum duration for a full throttle alert
 
 is_gas = F.col("signal_id") == gas_signal
-gasDf = cleanDf.filter(is_gas)
+gasDf = validDf.filter(is_gas)
 
 #Gas per vehicle
 print("Gas pedal per vehicle: ")
@@ -148,7 +183,7 @@ print("Full throttle readings per vehicle: ")
 gasDf.filter(F.col("value") >= full_throttle).groupBy("vehicle_name").count().show()
 
 #Speed dataframe
-speedDf = cleanDf.filter(is_speed & ~F.col("vehicle_id").isin(bad_ids))
+speedDf = validDf.filter(is_speed)
 
 avg_speed_pd = (
     speedDf.groupBy("vehicle_name")
@@ -191,17 +226,17 @@ def bar_plot(df, ycol, ylabel, title, color, filename, fmt="%.1f"):
     plt.close(fig)
 
 bar_plot(avg_speed_pd, "average_speed", "Average speed (m/s)",
-         "Average speed per vehicle", "steelblue", "avg_speed_per_vehicle.png")
+         "Average speed per vehicle", "steelblue", os.path.join(OUTPUT, "avg_speed_per_vehicle.png"))
 
 bar_plot(violations_pd, "violations", f"Readings above {speed_limit} m/s",
-         "Speed limit violations per vehicle", "indianred", "speed_violations_per_vehicle.png")
+         "Speed limit violations per vehicle", "indianred", os.path.join(OUTPUT, "speed_violations_per_vehicle.png"))
 
 #Gas plots
 bar_plot(avg_gas_pd, "average_gas", "Average gas pedal position (0-1)",
-         "Average gas pedal position per vehicle", "seagreen", "avg_gas_per_vehicle.png", fmt="%.2f")
+         "Average gas pedal position per vehicle", "seagreen", os.path.join(OUTPUT, "avg_gas_per_vehicle.png"), fmt="%.2f")
 
 bar_plot(full_gas_pd, "full_throttle_readings", f"Readings at or above {full_throttle}",
-         "Full throttle readings per vehicle", "darkorange", "full_throttle_per_vehicle.png", fmt="%.0f")
+         "Full throttle readings per vehicle", "darkorange", os.path.join(OUTPUT, "full_throttle_per_vehicle.png"), fmt="%.0f")
 
 #Communication gap threshold
 gap_minutes = 10
@@ -214,7 +249,8 @@ idle_speed = 0.5
 
 
 #Speed limit exceed report
-speed_alert_df = speed_alerts(cleanDf.filter(is_speed), speed_limit)
+#speed_alert_df = speed_alerts(cleanDf.filter(is_speed), speed_limit)
+speed_alert_df = speed_alerts(speedDf, speed_limit)
 
 #Full throttle: group consecutive readings at full throttle into runs
 wg = Window.partitionBy("vehicle_id", "session_id").orderBy("timestamp")
@@ -247,14 +283,15 @@ gas_alerts = (
 #Communication gap
 w = Window.partitionBy("vehicle_id").orderBy("timestamp")
 
-gap_alert_df = gap_alerts(cleanDf, gap_minutes)
+#gap_alert_df = gap_alerts(cleanDf, gap_minutes)
+gap_alert_df = gap_alerts(validDf, gap_minutes)
 
 
 #Idle sessions
 ws = Window.partitionBy("vehicle_id").orderBy("timestamp")
 
 runs = (
-    cleanDf.filter(is_speed)
+    speedDf
     .withColumn("stationary", F.col("value") < idle_speed)
     .withColumn("changed", (F.col("stationary") != F.lag("stationary").over(ws)).cast("int"))
     .withColumn("run_id", F.sum(F.coalesce("changed", F.lit(0))).over(ws))
@@ -280,38 +317,37 @@ idle_alerts = (
 #Combine alerts
 alerts = speed_alert_df.unionByName(gap_alert_df).unionByName(gas_alerts).unionByName(idle_alerts)
 
-#Store alerts as one readable CSV with the names used in the assignment
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-os.makedirs(OUTPUT, exist_ok=True)
+alerts_path = os.path.join(OUTPUT, "alerts")
 
-alerts_pd = (alerts
+(alerts
     .withColumnRenamed("vehicle_id", "VehicleID")
     .withColumnRenamed("timestamp", "Timestamp")
     .withColumnRenamed("anomaly_type", "AnomalyType")
     .withColumnRenamed("description", "Description")
     .orderBy("VehicleID", "Timestamp")
-    .toPandas())
-alerts_pd.to_csv(os.path.join(OUTPUT, "alerts.csv"), index=False, encoding="utf-8-sig")
-print(f"Saved {len(alerts_pd)} alerts to {OUTPUT}")
+    .coalesce(1)
+    .write.mode("overwrite").option("header", True).csv(alerts_path))
 
-#Show anomalies from pandas dataframe, to avoid recalculating the Spark dataframe with show()
-print(alerts_pd["AnomalyType"].value_counts().to_string())
+saved_alerts = spark.read.option("header", True).csv(alerts_path)
+print(f"Saved {saved_alerts.count()} alerts to {alerts_path}")
+saved_alerts.groupBy("AnomalyType").count().show()
 
-#Measure time between two Spark queries, one for vehicle speed and one for lag
-def timed(label, df, runs=3):
-    times = []
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        df.collect()
-        times.append(time.perf_counter() - t0)
-    print(f"{label}: " + ", ".join(f"{t:.2f}s" for t in times))
-
-timed("Query 1: Average speed per vehicle", speedDf.groupBy("vehicle_name").agg(F.avg("value")))
-timed("Query 2: Communication gaps (lag window)", gap_alert_df)
+q1 = timed("Query 1: Average speed per vehicle", speedDf.groupBy("vehicle_name").agg(F.avg("value")))
+q2 = timed("Query 2: Communication gaps (lag window)", gap_alert_df)
 
 elapsed = time.perf_counter() - script_start
 print(f"\nTotal execution time: {elapsed:.2f} s ({elapsed/60:.2f} min)")
 
+timings_csv = os.path.join(OUTPUT, "timings.csv")
+row = pd.DataFrame([{
+    "trips": trips,
+    "records": total_records,
+    **{f"q1_run{i}_s": round(t, 2) for i, t in enumerate(q1, 1)},
+    **{f"q2_run{i}_s": round(t, 2) for i, t in enumerate(q2, 1)},
+    "total_s": round(elapsed, 2),
+}])
+row.to_csv(timings_csv, mode="a", index=False, header=not os.path.exists(timings_csv))
+print(pd.read_csv(timings_csv).sort_values("trips").to_string(index=False))
 
 #Streaming
 HERE = os.path.dirname(os.path.abspath(__file__))
